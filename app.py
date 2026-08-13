@@ -1,8 +1,4 @@
-import eventlet
-eventlet.monkey_patch()
-
-# All your other imports like 'import os', 'from flask import Flask'
-# must come AFTER these two lines.
+# Standard imports
 import os
 import json
 import logging
@@ -19,7 +15,8 @@ from assemblyai.streaming.v3 import (
     StreamingParameters,
     StreamingClientOptions,
 )
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 
 # --- New/Corrected Imports ---
 import asyncio
@@ -29,12 +26,12 @@ import threading
 from typing import Dict, Any
 from tavily import TavilyClient 
 import requests
-
+print("APP STARTED")
 # =========================================
 # Setup
 # =========================================
 load_dotenv()
-
+print("ENV LOADED")
 # --- Environment Variables ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
@@ -53,7 +50,7 @@ if not TAVILY_API_KEY:
     raise Exception("TAVILY_API_KEY environment variable not set in .env file")
 
 # --- Configure Google Gemini API ---
-genai.configure(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -61,8 +58,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # --- Flask App and SocketIO Initialization ---
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "a_super_secret_key")
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
-
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+print("SOCKETIO READY")
 # --- Client Management ---
 clients = {}
 
@@ -197,23 +194,36 @@ async def process_llm_and_murf(prompt: str, client_sid: str):
                 current_persona_key = clients.get(client_sid, {}).get('persona', 'default')
                 persona_prompt = PERSONAS.get(current_persona_key, PERSONAS['default'])["prompt"]
 
+                # Force English responses regardless of input language
+                persona_prompt = "Always respond in English only, regardless of the language used by the user. " + persona_prompt
+
+                # Append response style instruction
+                style = clients.get(client_sid, {}).get('response_style', 'normal')
+                STYLE_SUFFIXES = {
+                    "quick":  " Always respond concisely in 2-3 sentences maximum. Be direct and to the point.",
+                    "normal": " Provide balanced, clear responses.",
+                    "tutor":  " Provide thorough, educational explanations with examples and step-by-step reasoning where helpful.",
+                }
+                persona_prompt += STYLE_SUFFIXES.get(style, STYLE_SUFFIXES["normal"])
+
                 tools = [get_weather, get_time, perform_search, get_latest_news, add_todo, view_todos]
-
-                model = genai.GenerativeModel(
-                    'gemini-1.5-flash',
-                    system_instruction=persona_prompt,
-                    tools=tools
-                )
-
-                chat = model.start_chat(enable_automatic_function_calling=True)
 
                 logging.info("--> Calling Gemini API (threaded)...")
 
-                # Run Gemini call in a thread (so eventlet doesn’t block)
                 loop = asyncio.get_event_loop()
 
                 def call_gemini_sync():
                     try:
+                        chat = gemini_client.chats.create(
+                            model='gemini-flash-latest',
+                            config=genai_types.GenerateContentConfig(
+                                system_instruction=persona_prompt,
+                                tools=tools,
+                                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+                                    disable=False
+                                ),
+                            )
+                        )
                         return chat.send_message(prompt)
                     except Exception as e:
                         logging.error(f"❌ Gemini sync call failed: {e}", exc_info=True)
@@ -222,7 +232,7 @@ async def process_llm_and_murf(prompt: str, client_sid: str):
                 try:
                     response = await asyncio.wait_for(
                         loop.run_in_executor(executor, call_gemini_sync),
-                        timeout=20
+                        timeout=30
                     )
                 except asyncio.TimeoutError:
                     logging.error("⏳ Gemini call timed out")
@@ -232,7 +242,9 @@ async def process_llm_and_murf(prompt: str, client_sid: str):
                     raise RuntimeError("No response from Gemini")
 
                 logging.info("<-- Gemini API call complete.")
-                final_text = response.text
+                final_text = response.text or ""
+                if not final_text.strip():
+                    logging.warning("Gemini returned empty text — possible pure function-call response")
                 logging.info(f"Gemini final response: '{final_text}'")
 
                 # Split response into sentences
@@ -283,11 +295,18 @@ def transcribe_task(sid: str):
             yield data
 
     try:
-        streaming_params = StreamingParameters(sample_rate=16000, enable_turn_detection=True)
+        logging.info(f"[transcribe_task] Connecting AssemblyAI for SID: {sid}")
+        streaming_params = StreamingParameters(
+            sample_rate=16000,
+            enable_turn_detection=True,
+            language_codes=['en'],   # force English transcription
+        )
         client.connect(streaming_params)
+        logging.info(f"[transcribe_task] AssemblyAI connected. Starting stream for SID: {sid}")
         client.stream(read_from_queue(audio_queue))
+        logging.info(f"[transcribe_task] Stream ended for SID: {sid}")
     except Exception as e:
-        logging.error(f"Error in transcribe_task for {sid}: {e}")
+        logging.error(f"Error in transcribe_task for {sid}: {e}", exc_info=True)
     finally:
         try: 
             client.disconnect()
@@ -316,17 +335,22 @@ def handle_connect():
         logging.error(f"Streaming error: {error}")
 
     try:
-        client = StreamingClient(StreamingClientOptions(api_key=ASSEMBLYAI_API_KEY))
+        client = StreamingClient(StreamingClientOptions(
+            api_key=ASSEMBLYAI_API_KEY,
+            connect_timeout=15.0,       # default is 1.0s — too short for this network
+            max_connection_retries=3,
+        ))
         client.on(StreamingEvents.Begin, on_open)
         client.on(StreamingEvents.Turn, on_turn)
         client.on(StreamingEvents.Error, on_error)
         
         # MODIFIED: Each user gets their own state, including a to-do list
         clients[sid] = {
-            "client": client, 
+            "client": client,
             "audio_queue": queue.Queue(),
             "persona": "default",
-            "todo_list": []  # This user's private to-do list
+            "response_style": "normal",  # quick | normal | tutor
+            "todo_list": []
         }
         socketio.start_background_task(transcribe_task, sid)
     except Exception as e:
@@ -340,11 +364,21 @@ def handle_set_persona(data):
         clients[sid]['persona'] = persona
         logging.info(f"Client {sid} set persona to: {persona}")
 
+@socketio.on("set_response_style")
+def handle_set_response_style(data):
+    sid = request.sid
+    style = data.get('style', 'normal')
+    if sid in clients:
+        clients[sid]['response_style'] = style
+        logging.info(f"Client {sid} set response style to: {style}")
+
 @socketio.on("stream")
 def handle_stream(data):
     sid = request.sid
     if sid in clients:
         clients[sid]["audio_queue"].put(data)
+    else:
+        logging.warning(f"Received 'stream' from unknown SID: {sid}")
 
 @socketio.on("disconnect")
 def handle_disconnect():
@@ -369,4 +403,4 @@ def test_connection():
         return f"Connection to Google failed: {e}", 500
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
-    socketio.run(app, host='0.0.0.0', port=port)
+    socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)

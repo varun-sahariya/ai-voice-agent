@@ -12,6 +12,7 @@ class VoiceAssistantPro {
         this.nextStartTime = 0;
         this.activeSourceNodes = [];
         this.currentPersona = 'default';
+        this.currentResponseStyle = 'normal';  // quick | normal | tutor
         this.apiKeys = {};
         this.isConfigured = false;
         
@@ -54,6 +55,14 @@ class VoiceAssistantPro {
         // Persona elements
         this.personaSelect = document.getElementById('personaSelect');
         this.personaPreview = document.getElementById('personaPreview');
+
+        // Response style pills
+        this.stylePills = document.querySelectorAll('.style-pill');
+
+        // Audio playback controls
+        this.playBtn   = document.getElementById('playBtn');
+        this.pauseBtn  = document.getElementById('pauseBtn');
+        this.stopAudioBtn = document.getElementById('stopAudioBtn');
         
         // API key inputs
         this.assemblyaiKeyInput = document.getElementById('assemblyaiKey');
@@ -85,7 +94,27 @@ class VoiceAssistantPro {
 
         // Persona events
         this.personaSelect.addEventListener('change', (e) => this.changePersona(e));
-        
+
+        // Response style pill events
+        this.stylePills.forEach(pill => {
+            pill.addEventListener('click', () => {
+                this.currentResponseStyle = pill.dataset.style;
+                this.stylePills.forEach(p => p.classList.remove('active'));
+                pill.classList.add('active');
+                if (this.socket) {
+                    this.socket.emit('set_response_style', { style: this.currentResponseStyle });
+                }
+            });
+        });
+
+        // Playback control events
+        this.playBtn.addEventListener('click', () => this.resumeAudio());
+        this.pauseBtn.addEventListener('click', () => this.pauseAudio());
+        this.stopAudioBtn.addEventListener('click', () => {
+            this.stopAudio();
+            this.setPlaybackBtns(false);
+        });
+
         // Click outside modal to close
         this.configOverlay.addEventListener('click', (e) => {
             if (e.target === this.configOverlay) {
@@ -142,6 +171,7 @@ class VoiceAssistantPro {
             this.updateConnectionStatus('Connected', true);
             this.updateStatus('Ready to chat!');
             this.socket.emit('set_persona', { persona: this.currentPersona });
+            this.socket.emit('set_response_style', { style: this.currentResponseStyle });
         });
         
         this.socket.on('disconnect', () => {
@@ -233,14 +263,22 @@ class VoiceAssistantPro {
             
             const mediaStreamSource = this.audioContext.createMediaStreamSource(this.mediaStream);
             this.workletNode = new AudioWorkletNode(this.audioContext, 'pcm-processor');
+
+            // Worklet MUST be connected downstream — browsers suppress processing on dead-end nodes
+            this.workletNode.connect(this.audioContext.destination);
             
             let audioBuffer = [];
+            let _firstEmit = true;
             this.workletNode.port.onmessage = (event) => {
                 audioBuffer.push(...event.data);
                 if (audioBuffer.length >= 4096) {
                     const pcm16Data = new Int16Array(audioBuffer.length);
                     for (let i = 0; i < audioBuffer.length; i++) {
                         pcm16Data[i] = Math.max(-1, Math.min(1, audioBuffer[i])) * 0x7FFF;
+                    }
+                    if (_firstEmit) {
+                        console.log('[audio] First chunk emitted to server, bytes:', pcm16Data.buffer.byteLength);
+                        _firstEmit = false;
                     }
                     this.socket.emit('stream', pcm16Data.buffer);
                     audioBuffer = [];
@@ -327,6 +365,26 @@ class VoiceAssistantPro {
         const content = document.createElement('div');
         content.className = 'message-content';
         content.textContent = text;
+
+        // Copy button for assistant messages
+        if (type === 'assistant') {
+            const copyBtn = document.createElement('button');
+            copyBtn.className = 'copy-btn';
+            copyBtn.textContent = '⎘ Copy';
+            copyBtn.title = 'Copy message';
+            copyBtn.addEventListener('click', () => {
+                const rawText = content._rawText || content.textContent || '';
+                navigator.clipboard.writeText(rawText).then(() => {
+                    copyBtn.textContent = '✓ Copied';
+                    copyBtn.classList.add('copied');
+                    setTimeout(() => {
+                        copyBtn.textContent = '⎘ Copy';
+                        copyBtn.classList.remove('copied');
+                    }, 2000);
+                });
+            });
+            content.appendChild(copyBtn);
+        }
         
         messageDiv.appendChild(avatar);
         messageDiv.appendChild(content);
@@ -340,7 +398,13 @@ class VoiceAssistantPro {
             this.addMessage('', 'assistant');
             lastMessage = this.chatHistory.querySelector('.message.assistant:last-child .message-content');
         }
-        lastMessage.textContent += text;
+        // Accumulate raw markdown text then render
+        lastMessage._rawText = (lastMessage._rawText || '') + text;
+        if (typeof marked !== 'undefined') {
+            lastMessage.innerHTML = marked.parse(lastMessage._rawText);
+        } else {
+            lastMessage.textContent = lastMessage._rawText;
+        }
         this.chatHistory.scrollTop = this.chatHistory.scrollHeight;
     }
 
@@ -434,16 +498,39 @@ class VoiceAssistantPro {
                 if (this.audioQueue.length === 0 && this.activeSourceNodes.length === 0) {
                     this.micContainer.classList.remove('speaking');
                     this.updateStatus(this.isRecording ? '🎙️ Listening...' : 'Ready to chat!');
+                    this.setPlaybackBtns(false);
                 }
             };
             
             if (this.activeSourceNodes.length === 1) {
                 this.micContainer.classList.add('speaking');
                 this.updateStatus('🔊 AI is speaking...', 'speaking');
+                this.setPlaybackBtns(true);
             }
             
         } catch (error) {
             console.error('Error processing audio chunk:', error);
+        }
+    }
+
+    // --- Playback control helpers ---
+    setPlaybackBtns(active) {
+        this.playBtn.disabled = !active;
+        this.pauseBtn.disabled = !active;
+        this.stopAudioBtn.disabled = !active;
+    }
+
+    pauseAudio() {
+        if (this.playbackContext && this.playbackContext.state === 'running') {
+            this.playbackContext.suspend();
+            this.updateStatus('⏸ Audio paused');
+        }
+    }
+
+    resumeAudio() {
+        if (this.playbackContext && this.playbackContext.state === 'suspended') {
+            this.playbackContext.resume();
+            this.updateStatus('🔊 AI is speaking...', 'speaking');
         }
     }
 
